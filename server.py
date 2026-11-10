@@ -186,6 +186,8 @@ def atender_cliente(conn, addr):
             maior_lance = valor_lance
             maior_lance_participante = id_participante
 
+        enviar_aviso_lance_udp()  # enviar aviso de lance maior via UDP
+
 
         #resposta de sucesso
         resposta = {
@@ -214,6 +216,8 @@ def atender_cliente(conn, addr):
 
     tempo_restante = max(0, duracao - (time.time() - inicio_leilao))
 
+    situacao_leilao = "Leilão aberto" if leilao_iniciado else "Leilão fechado"
+
     if mensagem.get("tipo") == "CONSULTAR":
         #enviar informações do leilão para o participante
         resposta = {
@@ -221,7 +225,8 @@ def atender_cliente(conn, addr):
             "item": item,
             "maior_lance": maior_lance,
             "tempo_restante": tempo_restante,
-            "nome_lider": nome_lider
+            "nome_lider": nome_lider,
+            "situacao": situacao_leilao
         }
         resposta_str = json.dumps(resposta) + "\n"
         conn.sendall(resposta_str.encode())
@@ -244,6 +249,10 @@ def iniciar_leilao():
 
 #  thread organizador
 thread = threading.Thread(target=iniciar_leilao, args=())
+thread.start()
+
+#  thread encerrar leilão
+thread = threading.Thread(target=encerrar_leilao, args=())
 thread.start()
 
 
@@ -273,23 +282,88 @@ def enviar_informacoes_leilao():
             break
 
 
-def enviar_aviso_udp():
- #enviar aviso via UDP para os participantes
+ #aviso lance maior
+def enviar_aviso_lance_udp():
+        for id_participante, participante in participantes.items():
+            endereco = participante["endereco"]
+            porta_udp = participante["porta_udp"]
+
+            mensagem = {
+                "tipo": "LEILAO_AVISO",
+                "maior_lance": maior_lance,
+                "nome_lider": participantes[maior_lance_participante]["nome"] if maior_lance_participante is not None else None
+            }
+
+            mensagem_str = json.dumps(mensagem) + "\n"
+            server_udp.sendto(mensagem_str.encode(), (endereco, porta_udp))
+
+#aviso leilão encerrado
+def enviar_aviso_encerramento_udp():
+        for id_participante, participante in participantes.items():
+            endereco = participante["endereco"]
+            porta_udp = participante["porta_udp"]
+
+            mensagem = {
+                "tipo": "LEILAO_ENCERRADO",
+                "vencedor": participantes[maior_lance_participante]["nome"] if maior_lance_participante is not None else None,
+                "maior_lance": maior_lance
+            }
+
+            mensagem_str = json.dumps(mensagem) + "\n"
+            server_udp.sendto(mensagem_str.encode(), (endereco, porta_udp))
+
+
+
 
 
 #resultado do leilão
 def resultado_leilao():
     global leilao_iniciado, maior_lance, maior_lance_participante, historico_lances
 
+    leilao_iniciado = False
+
     if maior_lance_participante is None:
         print("Leilão encerrado. Nenhum lance foi registrado.")
-    if maior_lance_participante is not None:
+    else: maior_lance_participante is not None:
         nome_vencedor = participantes[maior_lance_participante]["nome"]
         print(f"Leilão encerrado. Vencedor: {nome_vencedor} com lance de {maior_lance}")
 
+    #enviar aos clientes o resultado do leilão
+    for id_participante, participante in participantes.items():
+
+        conn = participante["conn"] # recupera a conexão TCP
+
+        mensagem = {
+            "tipo": "LEILAO_RESULTADO",
+            "vencedor": nome_vencedor if maior_lance_participante is not None else None,
+            "maior_lance": maior_lance
+        }
+
+        mensagem_str = json.dumps(mensagem) + "\n"
+        conn.sendall(mensagem_str.encode())
+
+
+    #apresentar histórico de lances
+    print("Histórico de lances:")
+
+    leilao_iniciado = False
+
+    enviar_aviso_encerramento_udp()  # enviar aviso de encerramento via UDP
 
 
 
+# encerrar leilão após o tempo determinado
+def encerrar_leilao():
+    global leilao_iniciado, inicio_leilao
+
+    while True:
+        if leilao_iniciado and (time.time() - inicio_leilao) >= duracao:
+            print("Tempo do leilão esgotado.")
+            resultado_leilao()
+            break
+
+        time.sleep(0.1) #para evitar uso excessivo
+        
 while True:
     # aceitar conexão
     conn, addr = server_tcp.accept()
