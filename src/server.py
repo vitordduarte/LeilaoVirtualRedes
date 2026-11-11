@@ -3,6 +3,7 @@ import logging
 import socket
 import threading
 import time
+from pathlib import Path
 
 HOST = "0.0.0.0"
 PORTA_TCP = 12346
@@ -11,6 +12,10 @@ PORTA_UDP = 12347
 ITEM = "Notebook"
 LANCE_MINIMO = 500
 DURACAO = 60
+
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "server.log"
 
 participantes = {}
 proximo_id = 1
@@ -37,9 +42,9 @@ server_udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server_udp.bind((HOST, PORTA_UDP))
 
 logging.basicConfig(
-	filename="server.log",
-	level=logging.INFO,
-	format="%(asctime)s | %(levelname)s | %(message)s",
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 print(f"Servidor TCP aguardando na porta {PORTA_TCP}")
