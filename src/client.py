@@ -27,8 +27,7 @@ class LeitorTCP:
 
         linha, self.buffer = self.buffer.split(b"\n", 1)
         mensagem = json.loads(linha.decode("utf-8"))
-        if not isinstance(mensagem, dict):
-            raise ValueError("A mensagem recebida não é um objeto JSON")
+        validar_mensagem(mensagem)
         return mensagem
 
 
@@ -55,6 +54,52 @@ def configurar_argumentos():
 
 def tipo_mensagem(mensagem):
     return str(mensagem.get("tipo", "DESCONHECIDO"))
+
+
+def validar_mensagem(mensagem):
+    if not isinstance(mensagem, dict):
+        raise ValueError("A mensagem recebida não é um objeto JSON")
+
+    nome_opcional = (str, type(None))
+    campos_por_tipo = {
+        "REGISTER_OK": {"id": int, "mensagem": str},
+        "REGISTER_ERROR": {"mensagem": str},
+        "ERROR": {"mensagem": str},
+        "LANCE_OK": {"valor": int, "mensagem": str},
+        "LANCE_ERROR": {"mensagem": str},
+        "RESULTADO_ERROR": {"mensagem": str},
+        "LEILAO_INFO": {"item": str, "lance_minimo": int, "duracao": int},
+        "SITUACAO": {
+            "item": str, "lance_minimo": int, "maior_lance": int,
+            "nome_lider": nome_opcional, "tempo_restante": int, "situacao": str,
+        },
+        "LEILAO_RESULTADO": {
+            "vencedor": nome_opcional, "maior_lance": int, "historico": list,
+        },
+        "LEILAO_AVISO": {
+            "atualizacao": int, "maior_lance": int, "nome_lider": nome_opcional,
+        },
+        "LEILAO_ENCERRADO": {
+            "atualizacao": int, "vencedor": nome_opcional, "maior_lance": int,
+        },
+    }
+    tipo = mensagem.get("tipo")
+    if not isinstance(tipo, str) or tipo not in campos_por_tipo:
+        raise ValueError("Tipo de mensagem inválido ou desconhecido")
+
+    def validar_campos(objeto, campos):
+        for campo, esperado in campos.items():
+            if campo not in objeto or not isinstance(objeto[campo], esperado):
+                raise ValueError(f"Campo ausente ou inválido: {campo}")
+            if esperado is int and isinstance(objeto[campo], bool):
+                raise ValueError(f"Campo inteiro inválido: {campo}")
+
+    validar_campos(mensagem, campos_por_tipo[tipo])
+    if tipo == "LEILAO_RESULTADO":
+        for lance in mensagem["historico"]:
+            if not isinstance(lance, dict):
+                raise ValueError("Entrada inválida no histórico de lances")
+            validar_campos(lance, {"participante": str, "valor": int})
 
 
 def enviar_tcp(conexao, mensagem):
@@ -125,7 +170,14 @@ def exibir_mensagem(mensagem, protocolo):
 def receber_tcp(leitor):
     try:
         while not encerrar_cliente.is_set():
-            mensagem = leitor.receber_mensagem()
+            try:
+                mensagem = leitor.receber_mensagem()
+            except ValueError as erro:
+                logging.warning(
+                    "TCP | mensagem malformada de %s:%s | %s",
+                    *leitor.conexao.getpeername(), erro,
+                )
+                continue
             logging.info(
                 "TCP | recebimento | %s:%s -> %s:%s | %s",
                 *leitor.conexao.getpeername(),
@@ -133,7 +185,7 @@ def receber_tcp(leitor):
                 tipo_mensagem(mensagem),
             )
             exibir_mensagem(mensagem, "TCP")
-    except (ConnectionError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as erro:
+    except (ConnectionError, OSError) as erro:
         if not encerrar_cliente.is_set():
             logging.warning("TCP | desconexão/erro | %s", erro)
             with console_lock:
@@ -157,8 +209,7 @@ def receber_udp(soquete_udp):
 
         try:
             mensagem = json.loads(dados.decode("utf-8"))
-            if not isinstance(mensagem, dict):
-                raise ValueError("A mensagem UDP não é um objeto JSON")
+            validar_mensagem(mensagem)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as erro:
             logging.warning("UDP | mensagem malformada de %s:%s | %s", *origem, erro)
             continue

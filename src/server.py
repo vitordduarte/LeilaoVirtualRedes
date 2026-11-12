@@ -123,7 +123,7 @@ def registrar_participante(nome, porta_udp, endereco, conn):
 	if not isinstance(nome, str) or not nome.strip():
 		return None, "Nome inválido"
 
-	if not isinstance(porta_udp, int) or not 1 <= porta_udp <= 65535:
+	if not isinstance(porta_udp, int) or isinstance(porta_udp, bool) or not 1 <= porta_udp <= 65535:
 		return None, "Porta UDP inválida"
 
 	nome = nome.strip()
@@ -342,7 +342,7 @@ def processar_mensagem(conn, addr, mensagem):
 				maior_lance = valor_lance
 				maior_lance_participante = id_participante
 				historico_lances.append((id_participante, valor_lance))
-			preparar_aviso_locked("LEILAO_AVISO")
+				preparar_aviso_locked("LEILAO_AVISO")
 
 		if erro:
 			logging.info(
