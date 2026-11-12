@@ -11,6 +11,8 @@ TAMANHO_BUFFER = 4096
 
 encerrar_cliente = threading.Event()
 console_lock = threading.Lock()
+resposta_recebida = threading.Event()
+respostas_esperadas = frozenset()
 
 
 class LeitorTCP:
@@ -185,6 +187,8 @@ def receber_tcp(leitor):
                 tipo_mensagem(mensagem),
             )
             exibir_mensagem(mensagem, "TCP")
+            if tipo_mensagem(mensagem) in respostas_esperadas:
+                resposta_recebida.set()
     except (ConnectionError, OSError) as erro:
         if not encerrar_cliente.is_set():
             logging.warning("TCP | desconexão/erro | %s", erro)
@@ -224,10 +228,17 @@ def receber_udp(soquete_udp):
 
 
 def executar_menu(conexao):
+    global respostas_esperadas
+
     opcoes = {
         "1": ("LANCE", "valor"),
         "2": ("CONSULTAR", None),
         "3": ("RESULTADO", None),
+    }
+    respostas_por_operacao = {
+        "LANCE": frozenset({"LANCE_OK", "LANCE_ERROR", "ERROR"}),
+        "CONSULTAR": frozenset({"SITUACAO", "ERROR"}),
+        "RESULTADO": frozenset({"LEILAO_RESULTADO", "RESULTADO_ERROR", "ERROR"}),
     }
 
     while not encerrar_cliente.is_set():
@@ -257,7 +268,13 @@ def executar_menu(conexao):
                     print("Informe um número inteiro positivo.")
                 continue
             mensagem[campo] = valor
+        # Registra a espera antes do envio para não perder uma resposta rápida.
+        respostas_esperadas = respostas_por_operacao[tipo]
+        resposta_recebida.clear()
         enviar_tcp(conexao, mensagem)
+        while not resposta_recebida.wait(timeout=0.1):
+            if encerrar_cliente.is_set():
+                return
 
 
 def main():
