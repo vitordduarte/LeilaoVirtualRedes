@@ -13,6 +13,8 @@ PORTA_UDP = 12347
 ITEM = "Notebook"
 LANCE_MINIMO = 500
 DURACAO = 60
+LIMITE_MENSAGEM_TCP = 64 * 1024  # Bytes por solicitação, sem a quebra de linha.
+TIMEOUT_TCP = 1.0  # Limita envios; o timeout de leitura não desconecta clientes ociosos.
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,12 +58,29 @@ print(f"Servidor TCP aguardando na porta {PORTA_TCP}")
 print(f"Servidor UDP aguardando na porta {PORTA_UDP}")
 
 
+def obter_lock_conexao(conn):
+    with conexoes_lock:
+        return conexoes_locks.setdefault(conn, threading.RLock())
+
+
 def enviar_tcp(conn, mensagem):
     dados = (json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8")
-    with conexoes_lock:
-        lock = conexoes_locks.setdefault(conn, threading.Lock())
-    with lock:
-        conn.sendall(dados)
+    lock = obter_lock_conexao(conn)
+    try:
+        if not lock.acquire(timeout=TIMEOUT_TCP):
+            raise TimeoutError("Tempo esgotado aguardando envio TCP anterior")
+        try:
+            conn.sendall(dados)
+        finally:
+            lock.release()
+    except OSError as erro:
+        logging.warning("TCP | falha de envio | %s | %s", mensagem.get("tipo"), erro)
+        # Libera também a thread de leitura; ela fará a limpeza da conexão.
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        raise
     try:
         origem, porta_origem = conn.getsockname()
         destino, porta_destino = conn.getpeername()
@@ -166,25 +185,37 @@ def obter_participante_por_conexao(conn):
 	return None
 
 
-def enviar_informacoes_leilao():
-	mensagem = {
+def informacoes_leilao_locked():
+	"""Obtém os dados do item com estado_lock adquirido."""
+	if leilao_encerrado or (leilao_iniciado and tempo_esgotado_locked()):
+		situacao = "ENCERRADO"
+	else:
+		situacao = "ABERTO" if leilao_iniciado else "AGUARDANDO"
+	return {
 		"tipo": "LEILAO_INFO",
 		"item": ITEM,
 		"lance_minimo": LANCE_MINIMO,
 		"duracao": DURACAO,
+		"situacao": situacao,
 	}
 
-	with estado_lock:
-		conexoes = [
-			p["conn"] for p in participantes.values()
-			if p["conn"] is not None
-		]
 
-	for conn in conexoes:
-		try:
-			enviar_tcp(conn, mensagem)
-		except OSError:
-			pass
+def distribuir_tcp(mensagem, conexoes):
+    def enviar(conn):
+        try:
+            enviar_tcp(conn, mensagem)
+        except OSError:
+            pass  # enviar_tcp registra a falha e interrompe a conexão afetada.
+
+    for conn in conexoes:
+        threading.Thread(target=enviar, args=(conn,), daemon=True).start()
+
+
+def enviar_informacoes_leilao():
+    with estado_lock:
+        mensagem = informacoes_leilao_locked()
+        conexoes = [p["conn"] for p in participantes.values() if p["conn"] is not None]
+    distribuir_tcp(mensagem, conexoes)
 
 
 def iniciar_leilao():
@@ -195,8 +226,8 @@ def iniciar_leilao():
 
 		if resposta == "s":
 			with estado_lock:
-				if not participantes:
-					print("Não é possível iniciar o leilão sem participantes.")
+				if not any(p["conn"] is not None for p in participantes.values()):
+					print("Não é possível iniciar o leilão sem participantes conectados.")
 					continue
 
 				leilao_iniciado = True
@@ -249,11 +280,7 @@ def resultado_leilao():
         print(f"  {lance['participante']}: {lance['valor']}")
     logging.info("STATE | LEILAO_ENCERRADO | vencedor=%s maior_lance=%s",
                  vencedor, mensagem["maior_lance"])
-    for conn in conexoes:
-        try:
-            enviar_tcp(conn, mensagem)
-        except OSError as erro:
-            logging.warning("TCP | falha ao enviar resultado | %s", erro)
+    distribuir_tcp(mensagem, conexoes)
 
 
 def encerrar_leilao():
@@ -272,44 +299,44 @@ def processar_mensagem(conn, addr, mensagem):
 	tipo = mensagem.get("tipo")
 
 	if tipo == "REGISTER":
-		id_participante, erro = registrar_participante(
-			mensagem.get("nome"),
-			mensagem.get("porta_udp"),
-			addr[0],
-			conn,
-		)
-
-		if erro:
-			logging.warning(
-				"TCP | REGISTER_ERROR | %s:%s -> server:%s | reason=%s",
+		# Mantém cadastro e apresentação antes de qualquer envio assíncrono.
+		with obter_lock_conexao(conn):
+			id_participante, erro = registrar_participante(
+				mensagem.get("nome"),
+				mensagem.get("porta_udp"),
 				addr[0],
-				addr[1],
-				PORTA_TCP,
-				erro,
+				conn,
 			)
+
+			if erro:
+				logging.warning(
+					"TCP | REGISTER_ERROR | %s:%s -> server:%s | reason=%s",
+					addr[0],
+					addr[1],
+					PORTA_TCP,
+					erro,
+				)
+				enviar_tcp(
+					conn,
+					{
+						"tipo": "REGISTER_ERROR",
+						"mensagem": erro,
+					},
+				)
+				return False
+
 			enviar_tcp(
 				conn,
 				{
-					"tipo": "REGISTER_ERROR",
-					"mensagem": erro,
+					"tipo": "REGISTER_OK",
+					"id": id_participante,
+					"mensagem": "Cadastro realizado com sucesso",
 				},
 			)
-			return False
-
-		enviar_tcp(
-			conn,
-			{
-				"tipo": "REGISTER_OK",
-				"id": id_participante,
-				"mensagem": "Cadastro realizado com sucesso",
-			},
-		)
-		with estado_lock:
-			ja_iniciado = leilao_iniciado
-		if ja_iniciado:
-			enviar_tcp(conn, {"tipo": "LEILAO_INFO", "item": ITEM,
-			                 "lance_minimo": LANCE_MINIMO, "duracao": DURACAO})
-		return True
+			with estado_lock:
+				informacoes = informacoes_leilao_locked()
+			enviar_tcp(conn, informacoes)
+			return True
 
 	id_participante = obter_participante_por_conexao(conn)
 
@@ -461,15 +488,26 @@ def atender_cliente(conn, addr):
 	registrado = False
 
 	try:
+		conn.settimeout(TIMEOUT_TCP)
 		while True:
-			bloco_recebido = conn.recv(4096)
+			try:
+				bloco_recebido = conn.recv(4096)
+			except socket.timeout:
+				continue
 
 			if not bloco_recebido:
 				break
 
 			buffer += bloco_recebido
 
-			while b"\n" in buffer:
+			while buffer:
+				fim = buffer.find(b"\n")
+				if fim > LIMITE_MENSAGEM_TCP or (fim < 0 and len(buffer) > LIMITE_MENSAGEM_TCP):
+					logging.warning("TCP | recebimento | %s:%s -> server:%s | MESSAGE_TOO_LARGE", *addr, PORTA_TCP)
+					enviar_tcp(conn, {"tipo": "ERROR", "mensagem": "Mensagem TCP excede o limite de bytes"})
+					return
+				if fim < 0:
+					break
 				linha, buffer = buffer.split(b"\n", 1)
 
 				if not linha.strip():

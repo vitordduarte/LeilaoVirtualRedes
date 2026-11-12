@@ -8,6 +8,7 @@ from pathlib import Path
 PORTA_TCP = 12346
 PORTA_UDP_SERVIDOR = 12347
 TAMANHO_BUFFER = 4096
+LIMITE_MENSAGEM_TCP = 1024 * 1024  # Respostas podem incluir todo o histórico.
 
 encerrar_cliente = threading.Event()
 console_lock = threading.Lock()
@@ -21,7 +22,13 @@ class LeitorTCP:
         self.buffer = b""
 
     def receber_mensagem(self):
-        while b"\n" not in self.buffer:
+        while True:
+            fim = self.buffer.find(b"\n")
+            if fim > LIMITE_MENSAGEM_TCP or (fim < 0 and len(self.buffer) > LIMITE_MENSAGEM_TCP):
+                self.buffer = b""
+                raise ConnectionError("Mensagem TCP excede o limite de bytes")
+            if fim >= 0:
+                break
             bloco = self.conexao.recv(TAMANHO_BUFFER)
             if not bloco:
                 raise ConnectionError("Conexão encerrada pelo servidor")
@@ -70,7 +77,7 @@ def validar_mensagem(mensagem):
         "LANCE_OK": {"valor": int, "mensagem": str},
         "LANCE_ERROR": {"mensagem": str},
         "RESULTADO_ERROR": {"mensagem": str},
-        "LEILAO_INFO": {"item": str, "lance_minimo": int, "duracao": int},
+        "LEILAO_INFO": {"item": str, "lance_minimo": int, "duracao": int, "situacao": str},
         "SITUACAO": {
             "item": str, "lance_minimo": int, "maior_lance": int,
             "nome_lider": nome_opcional, "tempo_restante": int, "situacao": str,
@@ -119,8 +126,13 @@ def exibir_mensagem(mensagem, protocolo):
     tipo = tipo_mensagem(mensagem)
     with console_lock:
         if tipo == "LEILAO_INFO":
+            descricao = {
+                "AGUARDANDO": "Aguardando início do leilão",
+                "ABERTO": "Leilão iniciado",
+                "ENCERRADO": "Leilão encerrado",
+            }.get(mensagem["situacao"], mensagem["situacao"])
             print(
-                "\nLeilão iniciado: "
+                f"\n{descricao}: "
                 f"{mensagem['item']} | mínimo: {mensagem['lance_minimo']} | "
                 f"duração: {mensagem['duracao']}s"
             )
@@ -313,6 +325,16 @@ def main():
         exibir_mensagem(resposta, "TCP")
         if tipo_mensagem(resposta) != "REGISTER_OK":
             return
+
+        # O servidor envia a apresentação junto da confirmação de cadastro.
+        informacoes = leitor.receber_mensagem()
+        logging.info(
+            "TCP | recebimento | %s:%s -> %s:%s | %s",
+            *conexao.getpeername(), *conexao.getsockname(), tipo_mensagem(informacoes),
+        )
+        if tipo_mensagem(informacoes) != "LEILAO_INFO":
+            raise ValueError("Esperada a apresentação do leilão após o cadastro")
+        exibir_mensagem(informacoes, "TCP")
 
         threading.Thread(
             target=receber_tcp, args=(leitor,), daemon=True
