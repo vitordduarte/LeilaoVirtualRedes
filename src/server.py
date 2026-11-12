@@ -1,5 +1,6 @@
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -31,11 +32,15 @@ numero_atualizacao = 0
 
 estado_lock = threading.Lock()
 servidor_encerrando = threading.Event()
+fila_avisos = queue.Queue()
+conexoes_lock = threading.Lock()
+conexoes_locks = {}
 
 server_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 server_tcp.bind((HOST, PORTA_TCP))
 server_tcp.listen()
+server_tcp.settimeout(0.5)
 
 server_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server_udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -52,13 +57,64 @@ print(f"Servidor UDP aguardando na porta {PORTA_UDP}")
 
 
 def enviar_tcp(conn, mensagem):
-	dados = (json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8")
-	conn.sendall(dados)
+    dados = (json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8")
+    with conexoes_lock:
+        lock = conexoes_locks.setdefault(conn, threading.Lock())
+    with lock:
+        conn.sendall(dados)
+    try:
+        origem, porta_origem = conn.getsockname()
+        destino, porta_destino = conn.getpeername()
+        logging.info("TCP | envio | %s:%s -> %s:%s | %s",
+                     origem, porta_origem, destino, porta_destino, mensagem.get("tipo"))
+    except OSError:
+        pass
 
 
 def enviar_udp(mensagem, endereco, porta):
-	dados = (json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8")
-	server_udp.sendto(dados, (endereco, porta))
+    dados = (json.dumps(mensagem, ensure_ascii=False) + "\n").encode("utf-8")
+    server_udp.sendto(dados, (endereco, porta))
+    logging.info("UDP | envio | server:%s -> %s:%s | %s | atualizacao=%s",
+                 PORTA_UDP, endereco, porta, mensagem.get("tipo"),
+                 mensagem.get("atualizacao"))
+
+
+def preparar_aviso_locked(tipo):
+    """Deve ser chamada com estado_lock adquirido; preserva a ordem das atualizações."""
+    global numero_atualizacao
+    numero_atualizacao += 1
+    nome = (participantes[maior_lance_participante]["nome"]
+            if maior_lance_participante is not None else None)
+    destinos = [(p["endereco"], p["porta_udp"])
+                for p in participantes.values() if p["conn"] is not None]
+    if tipo == "LEILAO_AVISO":
+        mensagem = {"tipo": tipo, "atualizacao": numero_atualizacao,
+                    "maior_lance": maior_lance, "nome_lider": nome}
+    else:
+        mensagem = {"tipo": tipo, "atualizacao": numero_atualizacao,
+                    "vencedor": nome, "maior_lance": maior_lance}
+    fila_avisos.put((mensagem, destinos))
+
+
+def distribuir_avisos_udp():
+    while not servidor_encerrando.is_set() or not fila_avisos.empty():
+        try:
+            mensagem, destinos = fila_avisos.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        try:
+            for endereco, porta in destinos:
+                try:
+                    enviar_udp(mensagem, endereco, porta)
+                except OSError as erro:
+                    logging.warning("UDP | falha | server:%s -> %s:%s | %s | %s",
+                                    PORTA_UDP, endereco, porta, mensagem["tipo"], erro)
+        finally:
+            fila_avisos.task_done()
+
+
+def tempo_esgotado_locked():
+    return inicio_leilao is not None and time.monotonic() >= inicio_leilao + DURACAO
 
 
 def registrar_participante(nome, porta_udp, endereco, conn):
@@ -73,6 +129,8 @@ def registrar_participante(nome, porta_udp, endereco, conn):
 	nome = nome.strip()
 
 	with estado_lock:
+		if leilao_encerrado:
+			return None, "Leilão encerrado"
 		for participante in participantes.values():
 			if participante["nome"].lower() == nome.lower():
 				return None, "Nome já cadastrado"
@@ -106,78 +164,6 @@ def obter_participante_por_conexao(conn):
 			if participante["conn"] is conn:
 				return id_participante
 	return None
-
-
-def enviar_aviso_lance_udp():
-	with estado_lock:
-		global numero_atualizacao
-		numero_atualizacao += 1
-		atualizacao = numero_atualizacao
-
-		nome_lider = (
-			participantes[maior_lance_participante]["nome"]
-			if maior_lance_participante is not None
-			else None
-		)
-
-		destinos = [
-			(participante["endereco"], participante["porta_udp"])
-			for participante in participantes.values()
-		]
-
-		mensagem = {
-			"tipo": "LEILAO_AVISO",
-			"atualizacao": atualizacao,
-			"maior_lance": maior_lance,
-			"nome_lider": nome_lider,
-		}
-
-	for endereco, porta_udp in destinos:
-		try:
-			enviar_udp(mensagem, endereco, porta_udp)
-		except OSError as erro:
-			logging.warning(
-				"UDP | LEILAO_AVISO | falha para %s:%s | %s",
-				endereco,
-				porta_udp,
-				erro,
-			)
-
-
-def enviar_aviso_encerramento_udp():
-	with estado_lock:
-		global numero_atualizacao
-		numero_atualizacao += 1
-		atualizacao = numero_atualizacao
-
-		vencedor = (
-			participantes[maior_lance_participante]["nome"]
-			if maior_lance_participante is not None
-			else None
-		)
-
-		destinos = [
-			(participante["endereco"], participante["porta_udp"])
-			for participante in participantes.values()
-		]
-
-		mensagem = {
-			"tipo": "LEILAO_ENCERRADO",
-			"atualizacao": atualizacao,
-			"vencedor": vencedor,
-			"maior_lance": maior_lance,
-		}
-
-	for endereco, porta_udp in destinos:
-		try:
-			enviar_udp(mensagem, endereco, porta_udp)
-		except OSError as erro:
-			logging.warning(
-				"UDP | LEILAO_ENCERRADO | falha para %s:%s | %s",
-				endereco,
-				porta_udp,
-				erro,
-			)
 
 
 def enviar_informacoes_leilao():
@@ -215,7 +201,7 @@ def iniciar_leilao():
 
 				leilao_iniciado = True
 				leilao_encerrado = False
-				inicio_leilao = time.time()
+				inicio_leilao = time.monotonic()
 
 			print("Iniciando leilão...")
 			logging.info(
@@ -233,8 +219,7 @@ def iniciar_leilao():
 			logging.info("STATE | LEILAO_CANCELADO")
 
 			servidor_encerrando.set()
-			server_tcp.close()
-			server_udp.close()
+			# O accept() usa timeout para observar o evento de encerramento.
 
 			return
 
@@ -242,91 +227,43 @@ def iniciar_leilao():
 
 
 def resultado_leilao():
-	global leilao_iniciado, leilao_encerrado
+    global leilao_iniciado, leilao_encerrado
 
-	with estado_lock:
-		if leilao_encerrado:
-			return
+    with estado_lock:
+        if leilao_encerrado or not leilao_iniciado:
+            return
+        leilao_iniciado = False
+        leilao_encerrado = True
+        vencedor = (participantes[maior_lance_participante]["nome"]
+                    if maior_lance_participante is not None else None)
+        historico = [{"participante": participantes[identificador]["nome"],
+                      "valor": valor} for identificador, valor in historico_lances]
+        conexoes = [p["conn"] for p in participantes.values() if p["conn"] is not None]
+        mensagem = {"tipo": "LEILAO_RESULTADO", "vencedor": vencedor,
+                    "maior_lance": maior_lance, "historico": historico}
+        preparar_aviso_locked("LEILAO_ENCERRADO")
 
-		leilao_iniciado = False
-		leilao_encerrado = True
-
-		if maior_lance_participante is not None:
-			nome_vencedor = participantes[maior_lance_participante]["nome"]
-			valor_vencedor = maior_lance
-			historico = list(historico_lances)
-		else:
-			nome_vencedor = None
-			valor_vencedor = 0
-			historico = list(historico_lances)
-
-		conexoes = [
-			p["conn"] for p in participantes.values()
-			if p["conn"] is not None
-		]
-
-	if nome_vencedor is None:
-		print("Leilão encerrado. Nenhum lance foi aceito.")
-	else:
-		print(
-			f"Leilão encerrado. Vencedor: {nome_vencedor} "
-			f"com lance de {valor_vencedor}"
-		)
-
-	print("Histórico de lances:")
-	for lance in historico:
-		id_participante, valor = lance
-		with estado_lock:
-			participante = participantes.get(id_participante)
-			nome = participante["nome"] if participante else "Desconhecido"
-		print(f"  {nome}: {valor}")
-
-	mensagem = {
-		"tipo": "LEILAO_RESULTADO",
-		"vencedor": nome_vencedor,
-		"maior_lance": valor_vencedor,
-		"historico": [
-			{
-				"participante": (
-					participantes[id_participante]["nome"]
-					if id_participante in participantes
-					else "Desconhecido"
-				),
-				"valor": valor,
-			}
-			for id_participante, valor in historico
-		],
-	}
-
-	logging.info(
-		"STATE | LEILAO_ENCERRADO | vencedor=%s maior_lance=%s",
-		nome_vencedor,
-		valor_vencedor,
-	)
-
-	for conn in conexoes:
-		try:
-			enviar_tcp(conn, mensagem)
-		except OSError:
-			pass
-
-	enviar_aviso_encerramento_udp()
+    print("Leilão encerrado.", "Vencedor: " + vencedor if vencedor else "Sem vencedor.")
+    print("Histórico de lances:")
+    for lance in historico:
+        print(f"  {lance['participante']}: {lance['valor']}")
+    logging.info("STATE | LEILAO_ENCERRADO | vencedor=%s maior_lance=%s",
+                 vencedor, mensagem["maior_lance"])
+    for conn in conexoes:
+        try:
+            enviar_tcp(conn, mensagem)
+        except OSError as erro:
+            logging.warning("TCP | falha ao enviar resultado | %s", erro)
 
 
 def encerrar_leilao():
-	while True:
-		with estado_lock:
-			iniciado = leilao_iniciado
-			inicio = inicio_leilao
-
-		if iniciado and inicio is not None:
-			tempo_decorrido = time.time() - inicio
-			if tempo_decorrido >= DURACAO:
-				print("Tempo do leilão esgotado.")
-				resultado_leilao()
-				return
-
-		time.sleep(0.1)
+    while not servidor_encerrando.is_set():
+        with estado_lock:
+            expirou = leilao_iniciado and tempo_esgotado_locked()
+        if expirou:
+            resultado_leilao()
+            return
+        servidor_encerrando.wait(0.05)
 
 
 def processar_mensagem(conn, addr, mensagem):
@@ -367,6 +304,11 @@ def processar_mensagem(conn, addr, mensagem):
 				"mensagem": "Cadastro realizado com sucesso",
 			},
 		)
+		with estado_lock:
+			ja_iniciado = leilao_iniciado
+		if ja_iniciado:
+			enviar_tcp(conn, {"tipo": "LEILAO_INFO", "item": ITEM,
+			                 "lance_minimo": LANCE_MINIMO, "duracao": DURACAO})
 		return True
 
 	id_participante = obter_participante_por_conexao(conn)
@@ -385,7 +327,7 @@ def processar_mensagem(conn, addr, mensagem):
 		valor_lance = mensagem.get("valor")
 
 		with estado_lock:
-			if leilao_encerrado:
+			if leilao_encerrado or (leilao_iniciado and tempo_esgotado_locked()):
 				erro = "Leilão encerrado"
 			elif not leilao_iniciado:
 				erro = "Leilão ainda não iniciado"
@@ -400,6 +342,7 @@ def processar_mensagem(conn, addr, mensagem):
 				maior_lance = valor_lance
 				maior_lance_participante = id_participante
 				historico_lances.append((id_participante, valor_lance))
+			preparar_aviso_locked("LEILAO_AVISO")
 
 		if erro:
 			logging.info(
@@ -434,7 +377,6 @@ def processar_mensagem(conn, addr, mensagem):
 				"valor": valor_lance,
 			},
 		)
-		enviar_aviso_lance_udp()
 		return True
 
 	if tipo == "CONSULTAR":
@@ -445,12 +387,10 @@ def processar_mensagem(conn, addr, mensagem):
 				else None
 			)
 
-			if leilao_iniciado and inicio_leilao is not None:
-				tempo_restante = max(
-					0, int(DURACAO - (time.time() - inicio_leilao))
-				)
+			if leilao_iniciado and not tempo_esgotado_locked():
+				tempo_restante = max(0, int(DURACAO - (time.monotonic() - inicio_leilao)))
 				situacao = "ABERTO"
-			elif leilao_encerrado:
+			elif leilao_encerrado or (leilao_iniciado and tempo_esgotado_locked()):
 				tempo_restante = 0
 				situacao = "ENCERRADO"
 			else:
@@ -477,35 +417,24 @@ def processar_mensagem(conn, addr, mensagem):
 
 	if tipo == "RESULTADO":
 		with estado_lock:
-			if not leilao_encerrado:
-				enviar_tcp(
-					conn,
-					{
-						"tipo": "RESULTADO_ERROR",
-						"mensagem": "O leilão ainda não foi encerrado",
-					},
+			encerrado = leilao_encerrado
+			if encerrado:
+				vencedor = (
+					participantes[maior_lance_participante]["nome"]
+					if maior_lance_participante is not None else None
 				)
-				return True
-
-			vencedor = (
-				participantes[maior_lance_participante]["nome"]
-				if maior_lance_participante is not None
-				else None
-			)
-
-			resposta = {
-				"tipo": "LEILAO_RESULTADO",
-				"vencedor": vencedor,
-				"maior_lance": maior_lance,
-				"historico": [
-					{
-						"participante": participantes[id_participante]["nome"],
-						"valor": valor,
-					}
-					for id_participante, valor in historico_lances
-				],
-			}
-
+				resposta = {
+					"tipo": "LEILAO_RESULTADO",
+					"vencedor": vencedor,
+					"maior_lance": maior_lance,
+					"historico": [
+						{"participante": participantes[identificador]["nome"], "valor": valor}
+						for identificador, valor in historico_lances
+					],
+				}
+			else:
+				resposta = {"tipo": "RESULTADO_ERROR",
+				            "mensagem": "O leilão ainda não foi encerrado"}
 		enviar_tcp(conn, resposta)
 		return True
 
@@ -565,6 +494,9 @@ def atender_cliente(conn, addr):
 					)
 					continue
 
+				logging.info("TCP | recebimento | %s:%s -> server:%s | %s",
+				             addr[0], addr[1], PORTA_TCP,
+				             mensagem.get("tipo") if isinstance(mensagem, dict) else "INVALID")
 				if not isinstance(mensagem, dict):
 					enviar_tcp(
 						conn,
@@ -617,6 +549,8 @@ def atender_cliente(conn, addr):
 				id_participante,
 			)
 
+		with conexoes_lock:
+			conexoes_locks.pop(conn, None)
 		conn.close()
 		print(f"Conexão encerrada: {addr}")
 
@@ -639,11 +573,17 @@ def main():
 		target=encerrar_leilao,
 		daemon=True
 	).start()
+	threading.Thread(target=distribuir_avisos_udp, daemon=True).start()
 
 	while not servidor_encerrando.is_set():
 		try:
 			conn, addr = server_tcp.accept()
+		except socket.timeout:
+			continue
 		except OSError:
+			break
+		if servidor_encerrando.is_set():
+			conn.close()
 			break
 
 		logging.info(
@@ -659,6 +599,15 @@ def main():
 			daemon=True,
 		).start()
 
+	servidor_encerrando.set()
+	with estado_lock:
+		conexoes = [p["conn"] for p in participantes.values() if p["conn"] is not None]
+	for conn in conexoes:
+		try:
+			conn.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+		conn.close()
 	print("Servidor encerrado.")
 
 
